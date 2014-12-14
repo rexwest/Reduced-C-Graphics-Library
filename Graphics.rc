@@ -87,12 +87,12 @@ structdef MATHLIB {
 	//
 	function : void seed(int s)
 	{
-	    mt[0] = s & 0xffffffff;
+	    mt[0] = s & 0x7fffffff;
 	    mti = 1;
 	    while(mti < n)
 	    {
 	        mt[mti] = (1812433253 * (mt[mti-1] ^ this.srl(mt[mti-1], 30)) + mti); 
-	        mt[mti] = mt[mti] & 0xffffffff;
+	        mt[mti] = mt[mti] & 0x7fffffff;
 	        ++mti;
 	    }
 	}
