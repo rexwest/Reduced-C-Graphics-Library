@@ -1,0 +1,1494 @@
+/*
+ *	An ASCII Raytracer written in RC
+ *  CSE 131 Fall 2014 Spec used
+ *
+ *	Author: Rex West
+ */
+
+
+/* *********************************************************************************************
+ * Statics and Constants
+ * *********************************************************************************************/
+
+//Debug
+const bool debug = false;
+
+//Period parameters
+const int n = 624;
+const int m = 397;
+const int matrixa = 0x09908b0d;
+const int uppermask = 0x08000000;
+const int lowermask = 0x07ffffff;
+
+//Math
+const int sin_accuracy = 6;//Taylor series expansion
+const int tan_accuracy = 6;//Bernoulli numbers
+const int bernoulli_accuracy = 13;//Bernoulli numbers
+const float sqrt_accuracy = 0.0001;//Maximum allowable error
+
+//Random
+static int[n] mt;
+static int mti = n+1;
+
+//Materials
+const float recursive_epsilon = 0.00001;
+
+//Screen
+const int pixel_width = 100;
+const int pixel_height = 100;
+
+//Surfaces
+const int surface_count = 3;
+const int light_count = 2;
+
+//Renderer
+const float time_delta_per_frame = 0.1;
+
+
+/* *********************************************************************************************
+ * Math Library
+ * *********************************************************************************************/
+structdef MATHLIB {
+
+	float pi;// = 3.14159
+	float one_over_pi;// = 1.0/3.14159
+	float air_refractive_index;// = 1.0003
+	float float_max;
+	float[bernoulli_accuracy] bernoulli;
+
+
+	//Shift Right for Reduced-C
+	//SRL using multiply instructions.
+	function : int srl(int num, int bits)
+	{
+		while(bits --> 0) { num = num / 2; }
+		return num;
+	}
+
+	//Shift Left for Reduced-C
+	//So expensive. Much CPU cycle. Wow.
+	function : int sll(int num, int bits)
+	{
+		while(bits --> 0) {	num = num * 2; }
+		return num;
+	}
+
+	function : int factorial(int n)
+	{
+		int acc = 1;
+		++n;
+		while(n --> 1) { acc = acc * n; }
+		return acc;
+	}
+
+	//Mersenne Twister port for Reduced-C
+	//Original C source code: http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/MT2002/CODES/mt19937ar.c
+	//Initialize mt[n] with a seed
+	//
+	function : void seed(int s)
+	{
+	    mt[0] = s & 0xffffffff;
+	    mti = 1;
+	    while(mti < n)
+	    {
+	        mt[mti] = (1812433253 * (mt[mti-1] ^ this.srl(mt[mti-1], 30)) + mti); 
+	        mt[mti] = mt[mti] & 0xffffffff;
+	        ++mti;
+	    }
+	}
+
+	//Generate a random number on [0,0xffffffff] interval
+	function : int random()
+	{
+	    int y;
+	    int[2] mag01;
+	    mag01[0] = 0x0;
+	    mag01[1] = matrixa;
+
+	    if(mti >= n)
+	    {
+	        int kk;
+
+	        if(mti == n+1)
+	        {
+	            this.seed(5489);
+	        }
+
+			kk=0;
+	        while(kk < (n-m))
+	        {
+	            y = (mt[kk] & uppermask) | (mt[kk+1] & lowermask);
+	            mt[kk] = mt[kk+m] ^ this.srl(y, 1) ^ mag01[y & 0x1];
+	        	++kk;
+	        }
+	        
+	        while(kk < (n-1))
+	        {
+	            y = (mt[kk] & uppermask) | (mt[kk+1] & lowermask);
+	            mt[kk] = mt[kk+(m-n)] ^ this.srl(y, 1) ^ mag01[y & 0x1];
+	            ++kk;
+	        }
+	        
+	        y = (mt[n-1] & uppermask) | (mt[0] & lowermask);
+	        mt[n-1] = mt[m-1] ^ this.srl(y, 1) ^ mag01[y & 0x1];
+
+	        mti = 0;
+	    }
+	  
+	    y = mt[mti++];
+
+	    /* Tempering */
+	    y = y ^ this.srl(y, 11);
+	    y = y ^ (this.sll(y, 7) & 0x9d2c5680);
+	    y = y ^ (this.sll(y, 15) & 0xefc60000);
+	    y = y ^ this.srl(y, 18);
+
+	    return y;
+	}
+
+	//Has an expected value of 0.47....wtf
+	function : float randomFloat()
+	{
+		//Random numbers from the twister are 31bit
+		return ((float)(this.random()& 0x7fffffff) )/(float)0x7fffffff;
+	}
+
+	function : float acos(float angle)
+	{
+		//TODO: implement acos
+		return 0.0;
+	}
+
+	function : float abs(float number)
+	{
+		float absval = number;
+		if(absval < 0.0) { absval = -1.0 * absval; }
+		return absval;
+	}
+
+	//Based on http://www.cs.wustl.edu/~kjg/CS101_SP97/Notes/SquareRoot/sqrt.html
+	function : float sqrt(float number)
+	{
+		float approx = 1.0;
+		while(this.abs((number/approx) - approx) > sqrt_accuracy)
+		{
+			approx = (approx + (number / approx)) / 2.0;
+		}
+		return approx;
+	}
+
+	function : float max(float left, float right)
+	{
+		if(left > right) { right = left; }
+		return right;
+	}
+
+	function : float min(float left, float right)
+	{
+		if(left < right) { right = left; }
+		return right;
+	}
+
+	function : float pow(float base, float exponent)
+	{
+		int val = 34;
+		float acc = 1.0;
+		while(exponent --> 0) { acc = acc * (base); }
+		return acc;
+	}
+
+	function : float fmod(float num, float mod)
+	{
+		float res = num / mod;
+		float one = 1.0;
+		if(res > 0.0) { one = -1.0; }
+		while(this.abs(res) > 1.0) { res = res + one; }
+		return res * mod;
+	}
+
+	//By Tarylor series, because look up tables are for scrubs
+	function : float sin(float angle)
+	{
+		angle = this.fmod(angle, this.pi * 2.0);
+
+		float acc = 0;
+		int rounds = sin_accuracy + 1;
+		float sign = -1;
+		int power;
+		while(rounds --> 0)
+		{
+			sign = -1.0 * sign;
+			power = ((sin_accuracy - rounds) * 2 + 1);
+			acc = acc + sign * (this.pow(angle, power) / (float)this.factorial(power));
+		}
+		return acc;
+	}
+
+	function : float cos(float angle)
+	{
+		return this.sin((this.pi/2.0) - angle);
+	}
+
+	function : float tan(float angle)
+	{
+		float res = 0;
+		float acc = 0;
+
+		int i = 1;
+		while(i <= tan_accuracy)
+		{
+			acc = this.bernoulli[2 * i] * this.pow(-4.0, i) * (1.0 - this.pow(4.0, i)) * this.pow(angle, 2.0 * i - 1);
+			res = res + acc / this.factorial(2 * i);
+			++i;
+		}
+
+		return res;
+	}
+
+};
+MATHLIB Math;
+
+
+/* *********************************************************************************************
+ * Vectors
+ * *********************************************************************************************/
+structdef VECTOR3 {
+
+	float[3] array;
+
+
+	//Print
+	function : void print()
+	{
+		cout << "<" << this.array[0] << ", " << this.array[1] << ", " << this.array[2] << ">" << endl;
+	}
+
+	//Get
+	function : float get(int element)
+	{
+		return this.array[element];
+	}
+	
+	//Set
+	function : void set(float x, float y, float z)
+	{
+		this.array[0] = x;
+		this.array[1] = y;
+		this.array[2] = z;
+	}
+
+	//Cross
+	function : VECTOR3 cross(VECTOR3 &that)
+	{
+		VECTOR3 res;
+		res.set(this.array[1]*that.array[2] - this.array[2]*that.array[1],
+				this.array[2]*that.array[0] - this.array[0]*that.array[2],
+				this.array[0]*that.array[1] - this.array[1]*that.array[0]);
+		return res;
+	}
+	
+	//Dot
+	function : float dot(VECTOR3 &that)
+	{
+		return this.array[0]*that.array[0] + this.array[1]*that.array[1] + this.array[2]*that.array[2];
+	}
+	
+	//Magnitude Squared
+	function : float magnitudeSqrd()
+	{
+		return this.array[0] * this.array[0] + this.array[1] * this.array[1] + this.array[2] * this.array[2];
+	}
+	
+	//Magnitude
+	function : float magnitude()
+	{
+		return Math.sqrt(this.array[0] * this.array[0] + this.array[1] * this.array[1] + this.array[2] * this.array[2]);
+	}
+	
+	//Angle
+	function : float angle(VECTOR3 &that)
+	{
+		return Math.acos(this.dot(that) / (this.magnitude() * that.magnitude()));
+	}
+
+	//Normalize
+	function : VECTOR3 normalize()
+	{
+		float invmag = 1.0 / this.magnitude();
+		VECTOR3 res;
+		res.set(this.array[0]*invmag, this.array[1]*invmag, this.array[2]*invmag);
+		return res;
+	}
+
+	//Normalize (mutating)
+	function : void normalizeM()
+	{
+		float invmag = 1.0 / this.magnitude();
+		this.array[0] = this.array[0] * invmag;
+		this.array[1] = this.array[1] * invmag;
+		this.array[2] = this.array[2] * invmag;
+	}
+	
+	//Multiply with Scalar
+	function : VECTOR3 multiplyScalar(float d)
+	{
+		VECTOR3 res;
+		res.set(this.array[0]*d, this.array[1]*d, this.array[2]*d);
+		return res;
+	}
+	
+	//Multiply with Scalar (mutating
+	function : void multiplyScalarM(float d)
+	{
+		this.array[0] = this.array[0] * d;
+		this.array[1] = this.array[1] * d;
+		this.array[2] = this.array[2] * d;
+	}
+
+	//Component-size Multiply
+	function : VECTOR3 multiply(VECTOR3 &that)
+	{
+		VECTOR3 res;
+		res.set(this.array[0]*that.array[0], this.array[1]*that.array[1], this.array[2]*that.array[2]);
+		return res;
+	}
+	
+	//Add vector
+	function : VECTOR3 addVector(VECTOR3 &that)
+	{
+		VECTOR3 res;
+		res.set(this.array[0]+that.array[0], this.array[1]+that.array[1], this.array[2]+that.array[2]);
+		return res;
+	}
+	
+	//Add scalar
+	function : VECTOR3 addScalar(float d)
+	{
+		VECTOR3 res;
+		res.set(this.array[0]+d, this.array[1]+d, this.array[2]+d);
+		return res;
+	}
+	
+	//Add components
+	function : VECTOR3 add(float u, float v, float w)
+	{
+		VECTOR3 res;
+		res.set(this.array[0]+u, this.array[1]+v, this.array[2]+w);
+		return res;
+	}
+	
+	//
+	function : VECTOR3 addMultiRight(VECTOR3 &that, float c)
+	{
+		VECTOR3 res;
+		res.set(this.array[0]+that.array[0]*c, this.array[1]+that.array[1]*c, this.array[2]+that.array[2]*c);
+		return res;
+	}
+	
+	//Subtract
+	function : VECTOR3 subtract(VECTOR3 &that)
+	{
+		VECTOR3 res;
+		res.set(this.array[0]-that.array[0], this.array[1]-that.array[1], this.array[2]-that.array[2]);
+		return res;
+	}
+	
+	//Subtract scalar
+	function : VECTOR3 subtractScalar(float d)
+	{
+		VECTOR3 res;
+		res.set(this.array[0]-d, this.array[1]-d, this.array[2]-d);
+		return res;
+	}
+
+	//Distance between
+	function : float distance(VECTOR3 &that)
+	{
+		float x = this.array[0] - that.array[0];
+		float y = this.array[1] - that.array[1];
+		float z = this.array[2] - that.array[2];
+		return Math.sqrt(x * x + y * y + z * z);
+	}
+
+	//Manherppan Distance
+	function : float manhattanDistance(VECTOR3 &that)
+	{
+		float x = this.array[0] - that.array[0];
+		float y = this.array[1] - that.array[1];
+		float z = this.array[2] - that.array[2];
+		return Math.abs(x) + Math.abs(y) + Math.abs(z);
+	}
+
+	//Chubbbyshev Distance
+	function : float tchebyshevDistance(VECTOR3 &that)
+	{
+		float x = this.array[0] - that.array[0];
+		float y = this.array[1] - that.array[1];
+		float z = this.array[2] - that.array[2];
+		return Math.max(Math.abs(x), Math.max(Math.abs(y), Math.abs(z)));
+	}
+
+};
+
+
+structdef VECTORLIB {
+
+	VECTOR3 positiveXAxis;
+	VECTOR3 negativeXAxis;
+	VECTOR3 positiveYAxis;
+	VECTOR3 negativeYAxis;
+	VECTOR3 positiveZAxis;
+	VECTOR3 negativeZAxis;
+
+
+	function : VECTOR3 reflect(VECTOR3& ray, VECTOR3& point, VECTOR3& normal)
+	{	
+		VECTOR3 dir = ray.normalize();
+		VECTOR3 norm = normal.normalize();
+		
+		float c = -2.0 * dir.dot(norm);
+
+		float rx = dir.array[0] + norm.array[0] * c;
+		float ry = dir.array[1] + norm.array[1] * c;
+		float rz = dir.array[2] + norm.array[2] * c;
+
+		float mag = Math.sqrt(rx * rx + ry * ry + rz * rz);
+		
+		VECTOR3 reflect;
+		reflect.set(rx/mag, ry/mag, rz/mag);
+		
+		return reflect;
+	}
+	
+	function : VECTOR3 halfVector(VECTOR3 &a, VECTOR3 &b)
+	{
+		float maga = 1.0/a.magnitude();
+		float magb = 1.0/b.magnitude();
+		
+		VECTOR3 res;
+		res.set(a.array[0]*maga + b.array[0]*magb,
+				a.array[1]*maga + b.array[1]*magb,
+				a.array[2]*maga + b.array[2]*magb);
+
+		return res.normalize();
+	}
+	
+	function : VECTOR3 cosineWeightedSample()
+	{
+		float s = Math.randomFloat();
+		float t = Math.randomFloat();
+		
+		float u = 2.0 * Math.pi * s;
+		float v = Math.sqrt(1.0 - t);
+
+		float x = v * Math.cos(u);
+		float y = Math.sqrt(t);
+		float z = v * Math.sin(u);
+		
+		VECTOR3 res;
+		res.set(x, y, z);
+		res.normalizeM();
+		return res;
+	}
+
+	function : VECTOR3 cosineWeightedSampleWithOrientation(VECTOR3 &xa, VECTOR3 &ya, VECTOR3 &za)
+	{
+		VECTOR3 s = this.cosineWeightedSample();
+		
+		s.set(s.array[0] * xa.array[0] + s.array[1] * ya.array[0] + s.array[2] * za.array[0],
+			  s.array[0] * xa.array[1] + s.array[1] * ya.array[1] + s.array[2] * za.array[1],
+			  s.array[0] * xa.array[2] + s.array[1] * ya.array[2] + s.array[2] * za.array[2]);
+		
+		return s.normalize();
+	}
+
+	function : VECTOR3 uniformHemisphereSample()
+	{
+		VECTOR3 sample;
+		sample.set(0.0, 0.0, 0.0);
+		
+		while(sample.magnitudeSqrd() > 1.0 || sample.get(1) < 0.0)
+		{
+			sample.set(2.0 * Math.randomFloat() - 1.0, 2.0 * Math.randomFloat() - 1.0, 2.0 * Math.randomFloat() - 1.0);
+		}
+		
+		return sample.normalize();
+	}
+
+	function : VECTOR3 uniformHemisphereSampleWithOrientation(VECTOR3 &xa, VECTOR3 &ya, VECTOR3 &za)
+	{
+		VECTOR3 s = this.uniformHemisphereSample();
+		
+		s.set(s.array[0] * xa.array[0] + s.array[1] * ya.array[0] + s.array[2] * za.array[0],
+			  s.array[0] * xa.array[1] + s.array[1] * ya.array[1] + s.array[2] * za.array[1],
+			  s.array[0] * xa.array[2] + s.array[1] * ya.array[2] + s.array[2] * za.array[2]);
+		
+		return s.normalize();
+	}
+
+	function : VECTOR3 diskSample(float radius, float weight)
+	{
+		VECTOR3 sample;
+		sample.set(0.0, 0.0, 0.0);
+		
+		float theta = Math.randomFloat() * Math.pi * 2.0;
+		float distance = Math.pow(Math.randomFloat(), weight) * radius;
+		sample.set(distance * Math.cos(theta), distance * Math.sin(theta), 0);
+		
+		return sample;
+	}
+
+	function : VECTOR3 uniformSphereSample()
+	{
+		VECTOR3 sample;
+		sample.set(0.0, 0.0, 0.0);
+		sample.set(2.0 * Math.randomFloat() - 1.0, 2.0 * Math.randomFloat() - 1.0, 2.0 * Math.randomFloat() - 1.0);
+		
+		while(sample.magnitudeSqrd() > 1.0)
+		{
+			sample.set(2.0 * Math.randomFloat() - 1.0, 2.0 * Math.randomFloat() - 1.0, 2.0 * Math.randomFloat() - 1.0);
+		}
+		
+		return sample.normalize();
+	}
+};
+VECTORLIB Vector;
+
+
+/* *********************************************************************************************
+ * Rays
+ * *********************************************************************************************/
+structdef RAY {
+
+	VECTOR3 direction;
+	VECTOR3 origin;
+
+
+	function : VECTOR3 evaluate(float t)
+	{
+		return this.origin.addMultiRight(this.direction, t);
+	}
+};
+
+
+/* *********************************************************************************************
+ * Colors
+ * *********************************************************************************************/
+structdef COLOR {
+
+	float[4] channels;
+
+
+	function : void set(float r, float g, float b, float a)
+	{
+		this.channels[0] = r;
+		this.channels[1] = g;
+		this.channels[2] = b;
+		this.channels[3] = a;
+	}
+
+	function : void setColor(COLOR& c)
+	{
+		this.set(c.channels[0], c.channels[1], c.channels[2], c.channels[3]);
+	}
+	
+	function : void setRGB(float r, float g, float b)
+	{
+		this.set(r, g, b, 1.0);
+	}
+
+	function : COLOR add(COLOR& c)
+	{
+		COLOR result;
+		result.set(
+			this.channels[0] + c.channels[0], 
+			this.channels[1] + c.channels[1], 
+			this.channels[2] + c.channels[2], 
+			this.channels[3]);
+		return result;
+	}
+	
+	function : COLOR addScalar(float d)
+	{
+		COLOR result;
+		result.set(this.channels[0] + d, this.channels[1] + d, this.channels[2] + d, this.channels[3]);
+		return result;
+	}
+	
+	function : COLOR subtract(COLOR& c)
+	{
+		COLOR result;
+		result.set(
+			this.channels[0] - c.channels[0], 
+			this.channels[1] - c.channels[1], 
+			this.channels[2] - c.channels[2], 
+			this.channels[3]);
+		return result;
+	}
+	
+	function : COLOR subtract3(float d)
+	{
+		COLOR result;
+		result.set(this.channels[0] - d, this.channels[1] - d, this.channels[2] - d, this.channels[3]);
+		return result;
+	}
+	
+	function : COLOR add3AfterMultiplyCC(COLOR& c, COLOR& d)
+	{
+		COLOR result;
+		result.set(
+			this.channels[0] + c.channels[0] * d.channels[0], 
+			this.channels[1] + c.channels[1] * d.channels[1], 
+			this.channels[2] + c.channels[2] * d.channels[2],
+			this.channels[3]);
+		return result;
+	}
+	
+	function : COLOR add3AfterMultiplyCS(COLOR& c, float d)
+	{
+		COLOR result;
+		result.set(
+			this.channels[0] + c.channels[0] * d, 
+			this.channels[1] + c.channels[1] * d, 
+			this.channels[2] + c.channels[2] * d,
+			this.channels[3]);
+		return result;
+	}
+	
+	function : COLOR multiplyScalar(float d)
+	{
+		COLOR result;
+		result.set(
+			this.channels[0] * d, 
+			this.channels[1] * d, 
+			this.channels[2] * d, 
+			this.channels[3]);
+		return result;
+	}
+	
+	function : COLOR multiplyColor(COLOR& c)
+	{
+		COLOR result;
+		result.set(
+			this.channels[0] * c.channels[0], 
+			this.channels[1] * c.channels[1], 
+			this.channels[2] * c.channels[2], 
+			this.channels[3]);
+		return result;
+	}
+	
+	function : COLOR multiplyCS(COLOR& c, float d)
+	{
+		COLOR result;
+		result.set(
+			this.channels[0] * c.channels[0] * d, 
+			this.channels[1] * c.channels[1] * d, 
+			this.channels[2] * c.channels[2] * d, 
+			this.channels[3]);
+		return result;
+	}
+	
+	function : COLOR interpolate(COLOR& color0, COLOR& color1, float t)
+	{
+		t = Math.min(1.0, Math.max(0.0, t));
+		
+		COLOR result;
+		result.set(
+			(1.0 - t) * color0.channels[0] + t * color1.channels[0],
+			(1.0 - t) * color0.channels[1] + t * color1.channels[1],
+			(1.0 - t) * color0.channels[2] + t * color1.channels[2],
+			(1.0 - t) * color0.channels[3] + t * color1.channels[3]);
+		return result;
+	}
+	
+	function : COLOR mixWithWhite(float d, float e)
+	{
+		COLOR result;
+		result.set(
+			this.channels[0] * d + e, 
+			this.channels[1] * d + e,
+			this.channels[2] * d + e,
+			this.channels[3]);
+		return result;
+	}
+	
+	function : COLOR duplicate()
+	{
+		COLOR result;
+		result.set(
+			this.channels[0],
+			this.channels[1],
+			this.channels[2],
+			this.channels[3]);
+		return result;
+	}
+	
+	function : COLOR clamp()
+	{
+		COLOR result;
+		result.set(
+			Math.min(1.0, Math.max(0.0, this.channels[0])),
+			Math.min(1.0, Math.max(0.0, this.channels[1])),
+			Math.min(1.0, Math.max(0.0, this.channels[2])),
+			Math.min(1.0, Math.max(0.0, this.channels[3])));
+		return result;
+	}
+
+	function : float intensity()
+	{
+		return (this.channels[0] + this.channels[1] + this.channels[2]) / 3.0;
+	}
+
+
+	//Print
+	function : void print()
+	{
+		cout << "<" << this.channels[0] << ", " << this.channels[1] << ", " << this.channels[2] << ", " << this.channels[3] << ">" << endl;
+	}
+
+
+	//Colors
+	function : COLOR black()
+	{
+		COLOR c;
+		c.set(0.0, 0.0 ,0.0, 1.0);
+		return c;
+	}
+
+	function : COLOR gray(float intensity)
+	{
+		COLOR c;
+		c.set(intensity, intensity , intensity, 1.0);
+		return c;
+	}
+
+	function : COLOR white()
+	{
+		COLOR c;
+		c.set(1.0, 1.0 ,1.0, 1.0);
+		return c;
+	}
+
+};
+COLOR Color;
+
+
+/* *********************************************************************************************
+ * Lights
+ * *********************************************************************************************/
+structdef LIGHT {
+
+	funcptr : COLOR (VECTOR3& point) illuminate;
+	funcptr : VECTOR3 (VECTOR3& point) direction;
+};
+
+structdef POINT_LIGHT {
+
+	float constant_attenuation;
+	float linear_attenuation;
+	float quadratic_attenuation;
+	
+	VECTOR3 position;
+	COLOR color;
+	float intensity;
+	
+
+	function : COLOR illuminate(VECTOR3& point)
+	{
+		VECTOR3 to_point = point.subtract(this.position);
+		float to_point_mag_sqrd = to_point.magnitudeSqrd();
+		float distance = Math.sqrt(to_point_mag_sqrd);
+		float attenuation = this.constant_attenuation +
+							this.linear_attenuation * distance +
+							this.quadratic_attenuation * to_point_mag_sqrd;
+		
+		return this.color.multiplyScalar(this.intensity / attenuation);
+	}
+
+	function : VECTOR3 direction(VECTOR3& point)
+	{
+		return point.subtract(this.position).normalize();
+	}
+};
+
+
+/* *********************************************************************************************
+ * Materials
+ * *********************************************************************************************/
+structdef MATERIAL {
+
+	funcptr : COLOR (RAY& ray, VECTOR3& point, VECTOR3& normal, COLOR& light, VECTOR3& fromLight) evaluate; 
+
+};
+
+
+structdef DIFFUSE_MATERIAL {
+
+	COLOR color;
+
+
+	//Ye Olde Lambertian Diffuse 
+	function : COLOR diffuse(COLOR& light, VECTOR3& normal, VECTOR3& fromLight)
+	{
+		float dot = normal.dot(fromLight);
+		
+		if(fromLight.magnitudeSqrd() == 0.0) {
+			return light.multiplyScalar(1.0);
+		}
+		
+		if(dot >= 0.0) {
+			return Color.black();
+		}
+		
+		return light.multiplyScalar( dot * -1.0 * (1.0/Math.pi) );
+	}
+
+	function : COLOR evaluate(RAY& ray, VECTOR3& point, VECTOR3& normal, COLOR& light, VECTOR3& fromLight)
+	{
+		float DdotN = normal.dot(ray.direction);
+
+		//If the normal is facing the wrong direction, flip it
+		if(DdotN > 0.0) {
+			normal = normal.multiplyScalar(-1.0);
+		}
+
+		COLOR reflected = this.diffuse(light, normal, fromLight);
+		return this.color.multiplyColor(reflected);
+	}
+
+};
+
+/* *********************************************************************************************
+ * Intersections
+ * *********************************************************************************************/
+structdef INTERSECTION {
+
+	bool intersected;//Did intersect
+	float distance;//Distance from ray origin to intersection point
+	VECTOR3 point;//Point of intersection
+	VECTOR3 normal;//Normal at point of intersection
+	MATERIAL material;//Material at intersection material
+
+};
+
+
+/* *********************************************************************************************
+ * Surfaces
+ * *********************************************************************************************/
+structdef SURFACE {
+
+	funcptr : INTERSECTION (RAY& ray) intersection;
+	funcptr : MATERIAL& () getMaterial;
+};
+
+
+structdef SPHERE {
+
+	VECTOR3 center;
+	float radius;
+	MATERIAL material;
+
+
+	function : INTERSECTION intersection(RAY& ray)
+	{
+		INTERSECTION intersection;
+
+		VECTOR3 e = ray.origin;
+		VECTOR3 d = ray.direction;
+		
+		//Precalc frequently used values/vectors
+		VECTOR3 EminusC = e.subtract(this.center);
+		float DdotD = d.dot(d);
+		float DdotEminusC = d.dot(EminusC);
+		
+		float discrim = (DdotEminusC * DdotEminusC) - DdotD * (EminusC.magnitudeSqrd() - (this.radius * this.radius));
+		
+		//If the discriminant is negative then the ray doesn't intersect in real space
+		if(discrim < 0.0) {
+			intersection.intersected = false;
+			return intersection;
+		}
+		
+		//Now that we know its >= 0, root it
+		discrim = Math.sqrt(discrim);
+		
+		//Get the negation of d
+		VECTOR3 negD = d.multiplyScalar(-1);
+		float negDdotEminusC = negD.dot(EminusC);
+		
+		//Get the time of intersection
+		float t = (negDdotEminusC - discrim) / DdotD;
+		
+		//Test if t is in the given time range
+		if(t < 0)
+		{
+			t = (negDdotEminusC + discrim) / DdotD;
+		}
+
+		if(t <= 0 || t > Math.float_max)
+		{
+			intersection.intersected = false;
+			return intersection;
+		}
+		
+		
+		//Point
+		VECTOR3 point = ray.evaluate(t);
+		VECTOR3 pointFromCenter = point.subtract(this.center).normalize();
+		
+		
+		//Return data about the intersection
+		intersection.intersected = true;
+		intersection.distance = ray.direction.magnitude() * t;
+		intersection.point = point;
+		intersection.normal = pointFromCenter;
+		intersection.material = this.material;
+
+		return intersection;
+	}
+
+	function : MATERIAL& getMaterial()
+	{
+		return this.material;
+	}
+
+};
+
+
+/* *********************************************************************************************
+ * Camera
+ * *********************************************************************************************/
+structdef CAMERA {
+
+	VECTOR3 position;
+	VECTOR3 viewing_direction;
+	VECTOR3 up;
+	float field_of_view;
+
+	//Internal vars
+	VECTOR3 x;
+	VECTOR3 y;
+	float image_plane_width;
+	float image_plane_height;
+	float image_plane_ratio;
+
+
+	function : void update()
+	{
+		//
+		this.x = this.viewing_direction.cross(this.up).normalize();
+		this.y = this.viewing_direction.cross(this.x).normalize();
+		
+		//Update image plane ratio
+		this.image_plane_ratio = (float)pixel_width / pixel_height;
+		
+		//Update the image plane values
+		this.image_plane_width = 2*Math.tan(this.field_of_view/2.0);
+		this.image_plane_height = this.image_plane_width / this.image_plane_ratio;
+	}
+
+	function : RAY getRay(int px, int py)
+	{
+		RAY ray;
+		ray.origin = this.position;
+		
+		//Pre-calculate the axis weights
+		float pw = (((px+0.5)/pixel_width) - 0.5) * this.image_plane_width;
+		float ph = (((py+0.5)/pixel_height) - 0.5) * this.image_plane_height;
+		
+		//Create the direction vector
+		ray.direction.set(
+			(this.viewing_direction.array[0] + this.x.array[0] * pw + this.y.array[0] * ph), 
+			(this.viewing_direction.array[1] + this.x.array[1] * pw + this.y.array[1] * ph), 
+			(this.viewing_direction.array[2] + this.x.array[2] * pw + this.y.array[2] * ph));
+		
+		ray.direction.normalizeM();
+		
+
+		return ray;
+	}
+
+};
+CAMERA Camera;
+
+
+/* *********************************************************************************************
+ * Scene
+ * *********************************************************************************************/
+structdef SCENE {
+
+	SURFACE*[surface_count] surfaces;
+	LIGHT*[light_count] lights;
+	COLOR skyColor;
+
+};
+SCENE Scene;
+
+
+/* *********************************************************************************************
+ * Pixel Buffers
+ * *********************************************************************************************/
+structdef PIXELBUFFER {
+
+	COLOR[pixel_width * pixel_height] pixels;
+
+
+	function : void set(int x, int y, COLOR& color)
+	{
+		this.pixels[y * pixel_width + x] = color;
+	}
+
+	function : void clear()
+	{
+		int y = 0;
+		int x = 0;
+
+		COLOR white;
+		white.setRGB(1.0, 1.0, 1.0);
+
+		while(y < pixel_height)
+		{
+			x = 0;
+			while(x < pixel_width)
+			{
+				this.pixels[y * pixel_width + x] = white;
+				++x;
+			}
+			++y;
+		}
+	}
+
+	//Grayscale Ramp Black -> White
+	//"$@B%8&WM#*oahkbdpqwmZO0QLCJUYXzcvunxrjft/\|()1{}[]?-_+~<>i!lI;:,"^`'. "
+	function : void drawCharacter(float intensity)
+	{
+		if(intensity < (1.0/70.0)) { cout << "$"; return; }
+		if(intensity < (2.0/70.0)) { cout << "@"; return; }
+		if(intensity < (3.0/70.0)) { cout << "B"; return; }
+		if(intensity < (4.0/70.0)) { cout << "%"; return; }
+		if(intensity < (5.0/70.0)) { cout << "8"; return; }
+		if(intensity < (6.0/70.0)) { cout << "&"; return; }
+		if(intensity < (7.0/70.0)) { cout << "W"; return; }
+		if(intensity < (8.0/70.0)) { cout << "M"; return; }
+		if(intensity < (9.0/70.0)) { cout << "#"; return; }
+		if(intensity < (10.0/70.0)) { cout << "*"; return; }
+		if(intensity < (11.0/70.0)) { cout << "o"; return; }
+		if(intensity < (12.0/70.0)) { cout << "a"; return; }
+		if(intensity < (13.0/70.0)) { cout << "h"; return; }
+		if(intensity < (14.0/70.0)) { cout << "k"; return; }
+		if(intensity < (15.0/70.0)) { cout << "b"; return; }
+		if(intensity < (16.0/70.0)) { cout << "d"; return; }
+		if(intensity < (17.0/70.0)) { cout << "p"; return; }
+		if(intensity < (18.0/70.0)) { cout << "q"; return; }
+		if(intensity < (19.0/70.0)) { cout << "w"; return; }
+		if(intensity < (20.0/70.0)) { cout << "m"; return; }
+		if(intensity < (21.0/70.0)) { cout << "Z"; return; }
+		if(intensity < (22.0/70.0)) { cout << "O"; return; }
+		if(intensity < (23.0/70.0)) { cout << "0"; return; }
+		if(intensity < (24.0/70.0)) { cout << "Q"; return; }
+		if(intensity < (25.0/70.0)) { cout << "L"; return; }
+		if(intensity < (26.0/70.0)) { cout << "C"; return; }
+		if(intensity < (27.0/70.0)) { cout << "J"; return; }
+		if(intensity < (28.0/70.0)) { cout << "U"; return; }
+		if(intensity < (29.0/70.0)) { cout << "Y"; return; }
+		if(intensity < (30.0/70.0)) { cout << "X"; return; }
+		if(intensity < (31.0/70.0)) { cout << "z"; return; }
+		if(intensity < (32.0/70.0)) { cout << "c"; return; }
+		if(intensity < (33.0/70.0)) { cout << "v"; return; }
+		if(intensity < (34.0/70.0)) { cout << "u"; return; }
+		if(intensity < (35.0/70.0)) { cout << "n"; return; }
+		if(intensity < (36.0/70.0)) { cout << "x"; return; }
+		if(intensity < (37.0/70.0)) { cout << "r"; return; }
+		if(intensity < (38.0/70.0)) { cout << "j"; return; }
+		if(intensity < (39.0/70.0)) { cout << "f"; return; }
+		if(intensity < (40.0/70.0)) { cout << "t"; return; }
+		if(intensity < (41.0/70.0)) { cout << "/"; return; }
+		//if(intensity < (42.0/70.0)) { cout << "\\"; return; }
+		if(intensity < (43.0/70.0)) { cout << "|"; return; }
+		if(intensity < (44.0/70.0)) { cout << "("; return; }
+		if(intensity < (45.0/70.0)) { cout << ")"; return; }
+		if(intensity < (46.0/70.0)) { cout << "1"; return; }
+		if(intensity < (48.0/70.0)) { cout << "{"; return; }
+		if(intensity < (49.0/70.0)) { cout << "}"; return; }
+		if(intensity < (50.0/70.0)) { cout << "["; return; }
+		if(intensity < (51.0/70.0)) { cout << "]"; return; }
+		if(intensity < (52.0/70.0)) { cout << "?"; return; }
+		if(intensity < (53.0/70.0)) { cout << "-"; return; }
+		if(intensity < (54.0/70.0)) { cout << "_"; return; }
+		if(intensity < (55.0/70.0)) { cout << "+"; return; }
+		if(intensity < (56.0/70.0)) { cout << "~"; return; }
+		if(intensity < (57.0/70.0)) { cout << "<"; return; }
+		if(intensity < (58.0/70.0)) { cout << ">"; return; }
+		if(intensity < (59.0/70.0)) { cout << "i"; return; }
+		if(intensity < (60.0/70.0)) { cout << "!"; return; }
+		if(intensity < (61.0/70.0)) { cout << "l"; return; }
+		if(intensity < (62.0/70.0)) { cout << "I"; return; }
+		if(intensity < (63.0/70.0)) { cout << ";"; return; }
+		if(intensity < (64.0/70.0)) { cout << ":"; return; }
+		if(intensity < (65.0/70.0)) { cout << ","; return; }
+		if(intensity < (66.0/70.0)) { cout << "^"; return; }
+		if(intensity < (67.0/70.0)) { cout << "`"; return; }
+		if(intensity < (68.0/70.0)) { cout << "'"; return; }
+		if(intensity < (69.0/70.0)) { cout << ","; return; }
+
+		cout << " ";
+		return;
+	}
+
+	function : void drawToScreen()
+	{
+		int y = 0;
+		int x = 0;
+		float intensity;
+
+		while(y < pixel_height-1)
+		{
+			x = 0;
+			while(x < pixel_width)
+			{
+				intensity = this.pixels[(y) * pixel_width + x].intensity() + this.pixels[(y+1) * pixel_width + x].intensity();
+				this.drawCharacter(intensity/2.0);
+				++x;
+			}
+
+			cout << endl;
+			y = y + 2;
+		}
+	}
+};
+PIXELBUFFER PixelBuffer;
+
+
+/* *********************************************************************************************
+ * Rendering Engine
+ * *********************************************************************************************/
+structdef RENDERENGINE {
+
+
+	int framesToRender;//Set to -1 to render on an open loop
+
+	funcptr : void (float dt) update;
+
+
+	function : void renderFrame(float dt)
+	{
+		//Call the update callback
+		this.update(dt);
+
+		int y = 0;
+		int x = 0;
+		RAY ray;
+
+		INTERSECTION closest;
+		INTERSECTION intersection;
+
+		COLOR color;
+		color.setRGB(1.0, 1.0, 1.0);
+		COLOR lightColor;
+		lightColor.setRGB(0.0, 0.0, 0.0);
+		COLOR evalColor;
+
+
+		VECTOR3 fromLight;
+
+		MATERIAL material;
+
+		while(x < pixel_width)
+		{
+			y = 0;
+			while(y < pixel_height)
+			{
+				ray = Camera.getRay(x, y);
+				closest.distance = Math.float_max;
+				closest.intersected = false;
+
+				//Test ray against all geometry
+				foreach(SURFACE*& s : Scene.surfaces)
+				{
+					intersection = s->intersection(ray);
+
+					//Determine closest intersection
+					if(intersection.intersected && intersection.distance < closest.distance)
+					{
+						closest = intersection;
+					}
+				}
+
+				//If the ray intersected a surface
+				if(closest.intersected)
+				{
+					//Get material of closest intersection
+					material = intersection.material;
+
+					//Get Light at point of intersection
+					lightColor.setRGB(0.0, 0.0, 0.0);
+					color.setRGB(0.0, 0.0, 0.0);
+					foreach(LIGHT*& l : Scene.lights)
+					{
+						lightColor = l->illuminate(closest.point);
+						fromLight = l->direction(closest.point);
+						evalColor = material.evaluate(ray, closest.point, closest.normal, lightColor, fromLight);
+						color = color.add(evalColor);
+					}
+
+				}else{
+					color = Scene.skyColor;
+				}
+
+
+				PixelBuffer.set(x, y, color);
+				++y;
+			}
+			++x;
+		}
+
+		//Write out the pixel buffer
+		PixelBuffer.drawToScreen();
+	}
+
+	function : void start()
+	{
+		//Initialize
+		PixelBuffer.clear();
+
+		//Render loop
+		while(this.framesToRender < 0 || this.framesToRender --> 0)
+		{
+			this.renderFrame(time_delta_per_frame);
+		}
+	}
+};
+RENDERENGINE Renderer;
+
+
+/* *********************************************************************************************
+ * Initializers
+ * *********************************************************************************************/
+function : void initializeLibraries()
+{
+	//Seed the pseudo-random number generator
+	Math.seed(0x1337);
+
+	//Math
+	Math.pi = 3.14159;
+	Math.one_over_pi = 1.0/3.14159;
+	Math.air_refractive_index = 1.0003;
+	Math.float_max = (float)0x7f7fffff;
+
+	Math.bernoulli[0] = 1.0;
+	Math.bernoulli[1] = -1.0/2.0;
+	Math.bernoulli[2] = 1.0/6.0;
+	Math.bernoulli[3] = 0.0;
+	Math.bernoulli[4] = -1.0/30.0;
+	Math.bernoulli[5] = 0.0;
+	Math.bernoulli[6] = 1.0/42.0;
+	Math.bernoulli[7] = 0.0;
+	Math.bernoulli[8] = -1.0/30.0;
+	Math.bernoulli[9] = 0.0;
+	Math.bernoulli[10] = 5.0/66.0;
+	Math.bernoulli[11] = 0.0;
+	Math.bernoulli[12] = -691.0/2730.0;
+
+	//Vector
+	Vector.positiveXAxis.array[0] = 1.0;
+	Vector.positiveXAxis.array[0] = 0.0;
+	Vector.positiveXAxis.array[0] = 0.0;
+
+	Vector.negativeXAxis.array[0] = -1.0;
+	Vector.negativeXAxis.array[0] = 0.0;
+	Vector.negativeXAxis.array[0] = 0.0;
+
+	Vector.positiveYAxis.array[0] = 0.0;
+	Vector.positiveYAxis.array[0] = 1.0;
+	Vector.positiveYAxis.array[0] = 0.0;
+
+	Vector.negativeYAxis.array[0] = 0.0;
+	Vector.negativeYAxis.array[0] = -1.0;
+	Vector.negativeYAxis.array[0] = 0.0;
+
+	Vector.positiveZAxis.array[0] = 0.0;
+	Vector.positiveZAxis.array[0] = 0.0;
+	Vector.positiveZAxis.array[0] = 1.0;
+
+	Vector.negativeZAxis.array[0] = 0.0;
+	Vector.negativeZAxis.array[0] = 0.0;
+	Vector.negativeZAxis.array[0] = -1.0;
+
+}
+
+POINT_LIGHT* point_light;
+POINT_LIGHT* point_light2;
+function : void initializeScene()
+{
+	Scene.skyColor = Color.white();
+
+	//Create a material
+	DIFFUSE_MATERIAL* diffuse;
+	new diffuse;
+	diffuse->color.set(0.9, 0.9, 0.9, 1.0);
+
+	//Allocate memory for all surfaces
+	float i = 2.5;
+	float divisor = 1.0;
+	SPHERE* sphere;
+	foreach(SURFACE*& s : Scene.surfaces)
+	{
+		new s;
+		//Create a sphere
+		new sphere;
+		sphere->radius = 1.70/divisor;
+		sphere->center.set(0.0 + i, 2.0, 0.0);
+		sphere->material.evaluate = diffuse->evaluate;
+		s->intersection = sphere->intersection;
+		s->getMaterial = sphere->getMaterial;
+
+
+		i = i - (sphere->radius + 1.70 / (divisor+0.4)) - 0.2;
+		divisor = divisor + 0.4;
+	}
+
+
+	//Allocate memory for all lights
+	foreach(LIGHT*& l : Scene.lights) {	new l; }
+
+	//Add a light or two
+	new point_light;
+	point_light->constant_attenuation = 1.0;
+	point_light->linear_attenuation = 0.0;
+	point_light->quadratic_attenuation = 1.0;
+	point_light->position.set(0.0, 6.6, -1.5);
+	point_light->color.set(1.0, 1.0, 1.0, 1.0);
+	point_light->intensity = 48.0;
+	Scene.lights[0]->illuminate = point_light->illuminate;
+	Scene.lights[0]->direction = point_light->direction;
+
+	new point_light2;
+	point_light2->constant_attenuation = 1.0;
+	point_light2->linear_attenuation = 0.0;
+	point_light2->quadratic_attenuation = 1.0;
+	point_light2->position.set(-5.0, -2.0, 0.5);
+	point_light2->color.set(1.0, 1.0, 1.0, 1.0);
+	point_light2->intensity = 16.0;
+	Scene.lights[1]->illuminate = point_light2->illuminate;
+	Scene.lights[1]->direction = point_light2->direction;
+}
+
+function : void initializeCamera()
+{
+	Camera.position.set(0.0, 2.0, 6.0);
+	Camera.viewing_direction.set(0.0, -0.1, -1.0);
+	Camera.viewing_direction.normalizeM();
+	Camera.up.set(0.0, 1.0, 0.0);
+	Camera.field_of_view = Math.pi / 2.0;
+	Camera.update();
+}
+
+
+/* *********************************************************************************************
+ * Update Callback for Renderer
+ * *********************************************************************************************/
+function : void update(float dt)
+{
+	VECTOR3 movement;
+	movement.set(0.0, 0.0, dt);
+	point_light->position = point_light->position.addVector(movement);
+
+	movement.set(0.0, dt/5.0, 0.0);
+	point_light2->position = point_light2->position.addVector(movement);
+
+
+	movement.set(-dt/12.0, dt/16.0, -dt/4);
+	Camera.position = Camera.position.addVector(movement);
+
+	movement.set(dt/36.0, 0.0, 0.0);
+	Camera.viewing_direction = Camera.viewing_direction.addVector(movement).normalize();
+}
+
+
+/* *********************************************************************************************
+ * Tests
+ * *********************************************************************************************/
+function : void runMathTests()
+{
+	//Math tests
+	cout << "sin(pi/4) = " << Math.sin(Math.pi / 4.0) << endl;
+	cout << "sqrt(2)/2 = " << Math.sqrt(2.0) / 2.0 << endl;
+	cout << "cos(pi/6) = " << Math.cos(Math.pi / 6.0) << endl;
+	cout << "sqrt(3)/2 = " << Math.sqrt(3.0) / 2.0 << endl;
+
+	int n = 5;
+	while(n --> 0) { cout << n << "! = " << Math.factorial(n) << endl; }
+
+	n = 5;
+	while(n --> 0) { cout << "random(): " << Math.random() << endl; }
+
+	n = 5;
+	while(n --> 0) { cout << "randomFloat(): " << Math.randomFloat() << endl; }
+
+	float avg = 0.0;
+	n = 50000;
+	while(n --> 0) { avg = avg + Math.randomFloat(); }
+	cout << "randomFloat() average is " << (avg/50000.0) << endl;
+
+
+	VECTOR3 vec;
+	vec.set(1, 2, 3);
+	vec.print();
+
+
+	VECTOR3 vec2;
+	vec2.set(3.744, 7.09, 12.3);
+	vec2.print();
+
+	VECTOR3 sum;
+	sum = vec.addVector(vec2);
+	sum.print();
+	sum = sum.cross(vec).normalize();
+	sum.print();
+
+	VECTOR3 sample;
+	n = 5;
+	while(n --> 0) { sample = Vector.cosineWeightedSample(); sample.print(); }
+
+	RAY ray;
+	ray.direction.set(1.0, 2.0, 3.0);
+	ray.direction.normalizeM();
+	ray.origin.set(0.0, 1.0, 0.0);
+
+	n = 5;
+	while(n --> 0) { ray.evaluate((float)n / 5.0).print(); }
+
+
+	cout << "tan(0) = " << Math.tan(0.0) << endl;
+	cout << "tan(pi/6) = " << Math.tan(Math.pi / 6.0) << endl;
+	cout << "tan(pi/4) = " << Math.tan(Math.pi / 4.0) << endl;
+	cout << "tan(pi/3) = " << Math.tan(Math.pi / 3.0) << endl;
+}
+
+
+/* *********************************************************************************************
+ * Main
+ * *********************************************************************************************/
+function : int main(int argc, int** argv)
+{
+	//Initialize libraries that have members that were not set at declaration
+	initializeLibraries();
+
+	//Setup scene
+	initializeScene();
+
+	//Setup camera
+	initializeCamera();
+
+
+	//Run debugging math tests
+	if(debug) { runMathTests(); }
+
+
+	//Render
+	Renderer.framesToRender = 80;
+	Renderer.update = update;
+	Renderer.start();
+	
+	return 0;
+}
