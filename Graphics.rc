@@ -1402,6 +1402,7 @@ function : void update(float dt)
 
 	movement.set(dt/36.0, 0.0, 0.0);
 	Camera.viewing_direction = Camera.viewing_direction.addVector(movement).normalize();
+	Camera.update();
 }
 
 
